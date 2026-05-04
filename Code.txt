@@ -1,0 +1,420 @@
+1) .env.example
+```dotenv
+# Required
+OPENAI_API_KEY=sk-...
+
+# Optional overrides
+# OPENAI_MODEL=gpt-4o-mini
+# OPENAI_BASE_URL=https://api.openai.com/v1
+
+# App-level access key (enables gate when set)
+APP_API_KEY=change-me
+```
+
+2) app/api/chat/route.ts
+```ts
+import { NextRequest } from 'next/server';
+import { z } from 'zod';
+import { timingSafeEqual } from 'node:crypto';
+
+export const runtime = 'nodejs';
+
+const BodySchema = z.object({
+  messages: z.array(z.object({
+    role: z.enum(['user', 'assistant', 'system']).default('user'),
+    content: z.string().min(1).max(8000)
+  })).min(1).max(50),
+  model: z.string().optional()
+});
+
+const SYSTEM_PROMPT = `You are Volt, a meticulous, concise, TypeScript-first coding assistant.
+- Prefer modern best practices, strong typing, and production-quality examples.
+- Keep explanations tight and only as long as necessary.
+- When providing code, ensure it is complete and runnable.
+`;
+
+function env(name: string, fallback?: string): string {
+  const v = process.env[name] ?? fallback;
+  if (!v) throw new Error(`Missing required env var: ${name}`);
+  return v;
+}
+
+function buildOpenAIRequest(body: z.infer<typeof BodySchema>) {
+  const OPENAI_BASE_URL = process.env.OPENAI_BASE_URL ?? 'https://api.openai.com/v1';
+  const OPENAI_API_KEY = env('OPENAI_API_KEY');
+  const model = body.model ?? process.env.OPENAI_MODEL ?? 'gpt-4o-mini';
+
+  const payload = {
+    model,
+    stream: true,
+    temperature: 0.7,
+    max_tokens: 1200,
+    messages: [
+      { role: 'system', content: SYSTEM_PROMPT },
+      ...body.messages
+        .filter(m => m.role === 'user' || m.role === 'assistant' || m.role === 'system')
+        .map(m => ({ role: m.role, content: m.content }))
+    ]
+  };
+
+  const url = `${OPENAI_BASE_URL.replace(/\/+$/,'')}/chat/completions`;
+  const headers = {
+    'Content-Type': 'application/json',
+    'Authorization': `Bearer ${OPENAI_API_KEY}`
+  };
+
+  return { url, headers, payload };
+}
+
+function sseToTextStream(sse: ReadableStream<Uint8Array>): ReadableStream<Uint8Array> {
+  const decoder = new TextDecoder('utf-8');
+  const encoder = new TextEncoder();
+
+  return new ReadableStream<Uint8Array>({
+    start(controller) {
+      const reader = sse.getReader();
+      let buffer = '';
+
+      const flushEvents = () => {
+        let sepIndex: number;
+        while ((sepIndex = buffer.indexOf('\n\n')) !== -1) {
+          const event = buffer.slice(0, sepIndex);
+          buffer = buffer.slice(sepIndex + 2);
+          const lines = event.split('\n').map(l => l.trim()).filter(Boolean);
+
+          const dataParts: string[] = [];
+          for (const line of lines) {
+            if (line.startsWith(':')) continue;
+            if (line.startsWith('data:')) {
+              dataParts.push(line.slice(5).trimStart());
+            }
+          }
+          const data = dataParts.join('\n');
+          if (!data) continue;
+          if (data === '[DONE]') {
+            controller.close();
+            return;
+          }
+          try {
+            const json = JSON.parse(data);
+            const delta = json?.choices?.[0]?.delta?.content ?? '';
+            if (delta) controller.enqueue(encoder.encode(delta));
+          } catch {
+            // ignore
+          }
+        }
+      };
+
+      const pump = async () => {
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+            flushEvents();
+          }
+          if (buffer.trim().length > 0) {
+            flushEvents();
+          }
+          controller.close();
+        } catch (err) {
+          controller.error(err);
+        }
+      };
+
+      pump();
+    }
+  });
+}
+
+function safeEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  try {
+    return timingSafeEqual(Buffer.from(a), Buffer.from(b));
+  } catch {
+    return false;
+  }
+}
+
+function extractClientKey(req: NextRequest): string | null {
+  const h = req.headers;
+  const fromHeader = h.get('x-app-key');
+  if (fromHeader) return fromHeader;
+  const auth = h.get('authorization');
+  if (!auth) return null;
+  const [scheme, token] = auth.split(' ');
+  if (scheme?.toLowerCase() === 'bearer' && token) return token.trim();
+  return null;
+}
+
+export async function POST(req: NextRequest) {
+  try {
+    // App-level API key gate (enabled only when APP_API_KEY is set)
+    const APP_API_KEY = process.env.APP_API_KEY;
+    if (APP_API_KEY && APP_API_KEY.length > 0) {
+      const clientKey = extractClientKey(req);
+      if (!clientKey || !safeEqual(clientKey, APP_API_KEY)) {
+        return new Response('Unauthorized', {
+          status: 401,
+          headers: { 'WWW-Authenticate': 'Bearer realm="volt", charset="UTF-8"' }
+        });
+      }
+    }
+
+    const json = await req.json();
+    const body = BodySchema.parse(json);
+
+    const { url, headers, payload } = buildOpenAIRequest(body);
+
+    const upstream = await fetch(url, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(payload),
+      signal: req.signal
+    });
+
+    if (!upstream.ok || !upstream.body) {
+      const text = await upstream.text().catch(() => '');
+      return new Response(text || `Upstream error (${upstream.status})`, { status: upstream.status });
+    }
+
+    const textStream = sseToTextStream(upstream.body);
+
+    return new Response(textStream, {
+      status: 200,
+      headers: {
+        'Content-Type': 'text/plain; charset=utf-8',
+        'Cache-Control': 'no-cache, no-transform',
+        'Connection': 'keep-alive',
+        'Transfer-Encoding': 'chunked'
+      }
+    });
+  } catch (err: any) {
+    const msg = err?.message || 'Bad Request';
+    const status = err?.name === 'ZodError' ? 400 : 500;
+    return new Response(msg, { status });
+  }
+}
+```
+
+3) app/page.tsx
+```tsx
+'use client';
+
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+
+type Role = 'user' | 'assistant';
+type Message = {
+  id: string;
+  role: Role;
+  content: string;
+  createdAt: number;
+};
+
+const newId = () => Math.random().toString(36).slice(2);
+
+export default function Page() {
+  const [messages, setMessages] = useState<Message[]>(() => {
+    if (typeof window === 'undefined') return [];
+    try {
+      const raw = localStorage.getItem('volt.messages');
+      if (!raw) return [];
+      const data = JSON.parse(raw) as Message[];
+      return data.filter(m => m.role === 'user' || m.role === 'assistant');
+    } catch {
+      return [];
+    }
+  });
+  const [input, setInput] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [appKey, setAppKey] = useState<string>(() => {
+    if (typeof window === 'undefined') return '';
+    return localStorage.getItem('volt.appKey') ?? '';
+  });
+
+  const controllerRef = useRef<AbortController | null>(null);
+  const scrollRef = useRef<HTMLDivElement | null>(null);
+  const inputRef = useRef<HTMLTextAreaElement | null>(null);
+  const keyRef = useRef<HTMLInputElement | null>(null);
+
+  useEffect(() => {
+    localStorage.setItem('volt.messages', JSON.stringify(messages));
+  }, [messages]);
+
+  useEffect(() => {
+    localStorage.setItem('volt.appKey', appKey);
+  }, [appKey]);
+
+  useEffect(() => {
+    scrollRef.current?.scrollTo({ top: 1e9, behavior: 'smooth' });
+  }, [messages, loading]);
+
+  const onSubmit = useCallback(async () => {
+    const userText = input.trim();
+    if (!userText || loading) return;
+    if (!appKey.trim()) {
+      keyRef.current?.focus();
+      return;
+    }
+
+    const userMsg: Message = { id: newId(), role: 'user', content: userText, createdAt: Date.now() };
+    const assistantMsg: Message = { id: newId(), role: 'assistant', content: '', createdAt: Date.now() };
+
+    setMessages(prev => [...prev, userMsg, assistantMsg]);
+    setInput('');
+    setLoading(true);
+
+    const controller = new AbortController();
+    controllerRef.current = controller;
+
+    try {
+      const res = await fetch('/api/chat', {
+        method: 'POST',
+        signal: controller.signal,
+        headers: {
+          'Content-Type': 'application/json',
+          'x-app-key': appKey
+        },
+        body: JSON.stringify({
+          messages: [...messages, userMsg].map(m => ({ role: m.role, content: m.content }))
+        })
+      });
+
+      if (!res.ok || !res.body) {
+        const text = await res.text().catch(() => '');
+        throw new Error(text || `Request failed: ${res.status}`);
+      }
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder('utf-8');
+      let done = false;
+
+      while (!done) {
+        const { value, done: d } = await reader.read();
+        done = d;
+        if (value) {
+          const chunk = decoder.decode(value, { stream: true });
+          setMessages(prev => {
+            const copy = [...prev];
+            const idx = copy.findIndex(m => m.id === assistantMsg.id);
+            if (idx !== -1) {
+              copy[idx] = { ...copy[idx], content: copy[idx].content + chunk };
+            }
+            return copy;
+          });
+        }
+      }
+    } catch (err: any) {
+      if (err?.name === 'AbortError') {
+        // aborted by user
+      } else {
+        setMessages(prev => [
+          ...prev.slice(0, -1),
+          { id: newId(), role: 'assistant', content: `Error: ${err?.message || 'Unknown error'}`, createdAt: Date.now() }
+        ]);
+      }
+    } finally {
+      setLoading(false);
+      controllerRef.current = null;
+      inputRef.current?.focus();
+    }
+  }, [input, loading, messages, appKey]);
+
+  const stop = useCallback(() => {
+    controllerRef.current?.abort();
+    controllerRef.current = null;
+    setLoading(false);
+  }, []);
+
+  const clear = useCallback(() => {
+    if (loading) stop();
+    setMessages([]);
+    setInput('');
+    localStorage.removeItem('volt.messages');
+  }, [loading, stop]);
+
+  const placeholder = useMemo(
+    () => 'Ask me anything. Shift+Enter for new line.',
+    []
+  );
+
+  const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      onSubmit();
+    }
+  };
+
+  return (
+    <div className="container">
+      <header className="header" style={{ justifyContent: 'space-between' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          <div className="logo" />
+          <div className="title">Volt Assistant</div>
+        </div>
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+          <input
+            ref={keyRef}
+            type="password"
+            className="textarea"
+            style={{ minHeight: 0, height: 36, maxWidth: 240, padding: '6px 10px' }}
+            placeholder="Enter app key"
+            value={appKey}
+            onChange={(e) => setAppKey(e.target.value)}
+          />
+          <button
+            className="btn"
+            onClick={() => keyRef.current?.blur()}
+            title="Save app key to this device"
+          >
+            Save
+          </button>
+        </div>
+      </header>
+
+      <section className="panel messages" ref={scrollRef}>
+        {messages.length === 0 && (
+          <div className="bubble" style={{ opacity: 0.9 }}>
+            Hi! I’m your coding assistant. Ask questions, request code, or get explanations.
+          </div>
+        )}
+        {messages.map((m) => (
+          <div key={m.id} className="msg">
+            <div className={`avatar ${m.role}`}>{m.role === 'user' ? 'U' : 'A'}</div>
+            <div>
+              <div className="meta">
+                {m.role === 'user' ? 'You' : 'Assistant'} • {new Date(m.createdAt).toLocaleTimeString()}
+              </div>
+              <div className="bubble">{m.content}</div>
+            </div>
+          </div>
+        ))}
+      </section>
+
+      <section className="panel inputBar">
+        <textarea
+          ref={inputRef}
+          className="textarea"
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          placeholder={placeholder}
+          onKeyDown={onKeyDown}
+        />
+        <div className="actions">
+          <button className="btn" onClick={onSubmit} disabled={loading || !input.trim() || !appKey.trim()}>
+            {loading ? 'Sending…' : 'Send'}
+          </button>
+          <button className="btn" onClick={stop} disabled={!loading}>Stop</button>
+          <button className="btn" onClick={clear} disabled={loading || messages.length === 0}>Clear</button>
+        </div>
+      </section>
+
+      <footer className="footer">
+        {process.env.NODE_ENV === 'development' && !appKey?.trim()
+          ? 'App key required (set APP_API_KEY in .env and enter it above).'
+          : 'Built with Next.js, TypeScript, and streaming fetch.'}
+      </footer>
+    </div>
+  );
+}
+```
